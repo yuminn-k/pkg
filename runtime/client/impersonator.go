@@ -78,6 +78,7 @@ func (i *Impersonator) GetClient(ctx context.Context) (rc.Client, *polling.Statu
 }
 
 // CanImpersonate checks if the given Kubernetes account can be impersonated.
+// When a kubeconfig is set, the account is looked up in the cluster it points to.
 func (i *Impersonator) CanImpersonate(ctx context.Context) bool {
 	name := i.defaultServiceAccount
 	if sa := i.serviceAccountName; sa != "" {
@@ -97,7 +98,20 @@ func (i *Impersonator) CanImpersonate(ctx context.Context) bool {
 			Namespace: i.serviceAccountNamespace,
 		},
 	}
-	if err := i.client.Get(ctx, rc.ObjectKeyFromObject(sa), sa); err != nil {
+	reader := i.client
+	if i.kubeConfigRef != nil {
+		// The account is impersonated in the cluster the kubeconfig points to.
+		restConfig, err := i.restConfigForKubeConfig(ctx)
+		if err != nil {
+			return false
+		}
+		reader, err = rc.New(restConfig, rc.Options{Scheme: i.scheme})
+		if err != nil {
+			return false
+		}
+	}
+
+	if err := reader.Get(ctx, rc.ObjectKeyFromObject(sa), sa); err != nil {
 		return false
 	}
 
@@ -152,23 +166,10 @@ func (i *Impersonator) defaultClient() (rc.Client, *polling.StatusPoller, error)
 }
 
 func (i *Impersonator) clientForKubeConfig(ctx context.Context) (rc.Client, *polling.StatusPoller, error) {
-	var restConfig *rest.Config
-	var err error
-
-	switch {
-	case i.kubeConfigProvider != nil:
-		getRESTConfigFromProvider := i.kubeConfigProvider
-		restConfig, err = getRESTConfigFromProvider(ctx, *i.kubeConfigRef, i.client)
-	case i.kubeConfigRef.SecretRef != nil:
-		restConfig, err = i.getRESTConfigFromSecret(ctx)
-	default:
-		return nil, nil, errors.New("invalid .spec.kubeConfig, neither .spec.kubeConfig.provider nor .spec.kubeConfig.secretRef is set")
-	}
+	restConfig, err := i.restConfigForKubeConfig(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-
-	restConfig = KubeConfig(ctx, restConfig, i.kubeConfigOpts)
 	i.setImpersonationConfig(restConfig)
 
 	restMapper, err := NewDynamicRESTMapper(restConfig)
@@ -187,6 +188,27 @@ func (i *Impersonator) clientForKubeConfig(ctx context.Context) (rc.Client, *pol
 	statusPoller := i.newStatusPoller(client, restMapper)
 
 	return client, statusPoller, err
+}
+
+// restConfigForKubeConfig returns the REST config for the kubeconfig reference, without impersonation.
+func (i *Impersonator) restConfigForKubeConfig(ctx context.Context) (*rest.Config, error) {
+	var restConfig *rest.Config
+	var err error
+
+	switch {
+	case i.kubeConfigProvider != nil:
+		getRESTConfigFromProvider := i.kubeConfigProvider
+		restConfig, err = getRESTConfigFromProvider(ctx, *i.kubeConfigRef, i.client)
+	case i.kubeConfigRef.SecretRef != nil:
+		restConfig, err = i.getRESTConfigFromSecret(ctx)
+	default:
+		return nil, errors.New("invalid .spec.kubeConfig, neither .spec.kubeConfig.provider nor .spec.kubeConfig.secretRef is set")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return KubeConfig(ctx, restConfig, i.kubeConfigOpts), nil
 }
 
 func (i *Impersonator) getRESTConfigFromSecret(ctx context.Context) (*rest.Config, error) {
