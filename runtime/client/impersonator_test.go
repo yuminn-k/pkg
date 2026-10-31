@@ -26,6 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	rc "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/fluxcd/pkg/apis/meta"
 )
@@ -103,6 +104,60 @@ func TestCanImpersonate(t *testing.T) {
 			)
 			got := imp.CanImpersonate(ctx)
 			g.Expect(got).To(Equal(tt.want))
+		})
+	}
+}
+
+func TestCanImpersonate_KubeConfig(t *testing.T) {
+	g := NewWithT(t)
+	ns, err := testEnv.CreateNamespace(ctx, "can-impersonate-kc")
+	g.Expect(err).NotTo(HaveOccurred())
+	testNamespace := ns.Name
+
+	// The remote cluster is the test environment, the local cluster is a fake client.
+	remoteSA := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "remote-sa", Namespace: testNamespace},
+	}
+	g.Expect(testEnv.CreateAndWait(ctx, remoteSA)).To(Succeed())
+	localSA := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "local-sa", Namespace: testNamespace},
+	}
+	localClient := fake.NewClientBuilder().WithObjects(localSA).Build()
+
+	provider := func(_ context.Context, _ meta.KubeConfigReference, _ rc.Client) (*rest.Config, error) {
+		return rest.CopyConfig(testEnv.Config), nil
+	}
+
+	tests := []struct {
+		name               string
+		serviceAccountName string
+		want               bool
+	}{
+		{
+			name:               "service account exists only in the remote cluster",
+			serviceAccountName: "remote-sa",
+			want:               true,
+		},
+		{
+			name:               "service account exists only in the local cluster",
+			serviceAccountName: "local-sa",
+			want:               false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+			imp := NewImpersonator(localClient,
+				WithKubeConfig(
+					&meta.KubeConfigReference{ConfigMapRef: &meta.LocalObjectReference{Name: "test"}},
+					KubeConfigOptions{},
+					testNamespace,
+					provider,
+				),
+				WithServiceAccount("", tt.serviceAccountName, testNamespace),
+			)
+			g.Expect(imp.CanImpersonate(ctx)).To(Equal(tt.want))
 		})
 	}
 }
